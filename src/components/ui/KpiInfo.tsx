@@ -45,6 +45,13 @@ export const KPI_EXPLAINERS: Record<string, KpiExplainer> = {
     calculation: "Hours planned this week (Σ per task: remaining effort ÷ working days to deadline, for days in this week) ÷ Weekly Working Hours × 100",
     example: "A 20h task due in 5 working days = 4h/day; 4 of those days fall this week → 16h → 40% of a 40h week",
   },
+  whatIfProjected: {
+    meaning:
+      "Maximum weekly average utilization during the selected period, including the proposed allocation. The busiest week on average — not the busiest single day.",
+    calculation:
+      "For each week in the scenario window: (existing planned hours + the scenario hours the engine schedules into that week) ÷ that week's available working hours × 100. Projected Utilization = the highest of those weekly figures. The candidate table and every allocation scenario use this same calculation.",
+    example: "Wk 1 avg 72%, Wk 2 avg 84%, Wk 3 avg 78% → Projected Utilization 84%",
+  },
 };
 
 export function KpiInfo({ topic }: { topic: keyof typeof KPI_EXPLAINERS }) {

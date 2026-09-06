@@ -5,17 +5,24 @@ import { FlaskConical, Loader2, CheckCircle2, Info } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { AiTag } from "@/components/ui/AiTag";
 import { CapacityBar } from "@/components/ui/ProgressBar";
+import { KpiInfo } from "@/components/ui/KpiInfo";
 import { getCapacityStatus } from "@/lib/capacity";
 import { runScenario, type ScenarioInput } from "@/lib/simulate";
 import { DEFAULT_SCENARIO_PROJECT, RECOMMENDATION_REASONS } from "@/data/scenarios";
 import { formatDisplayDate, toInputDateValue } from "@/lib/date";
 import { useSkills } from "@/store/skills-store";
+import { useTickets } from "@/store/tickets-store";
+import { useWorkLog } from "@/store/work-log-store";
+import { useCalendarEvents } from "@/store/calendar-events-store";
 import type { Employee } from "@/data/types";
 
 const PRIORITIES: ScenarioInput["priority"][] = ["High", "Medium", "Low"];
 
 export function WhatIfSimulator({ employees }: { employees: Employee[] }) {
   const { skillNames } = useSkills();
+  const { tickets } = useTickets();
+  const { getEntry } = useWorkLog();
+  const { events } = useCalendarEvents();
   // The central catalogue is the source of truth for the options; anything already
   // on the default scenario is kept even if it's not in the catalogue.
   const allSkillOptions = useMemo(
@@ -46,7 +53,7 @@ export function WhatIfSimulator({ employees }: { employees: Employee[] }) {
     setLoading(true);
     setResult(null);
     window.setTimeout(() => {
-      setResult(runScenario(employees, form));
+      setResult(runScenario(employees, form, tickets, getEntry, events));
       setLoading(false);
     }, 700);
   }
@@ -193,7 +200,12 @@ export function WhatIfSimulator({ employees }: { employees: Employee[] }) {
                     <th className="px-3 py-2.5">Employee</th>
                     <th className="px-3 py-2.5">Skill Match</th>
                     <th className="px-3 py-2.5">Current Utilization</th>
-                    <th className="px-3 py-2.5">Projected Utilization</th>
+                    <th className="px-3 py-2.5">
+                      <span className="inline-flex items-center gap-1.5">
+                        Projected Utilization
+                        <KpiInfo topic="whatIfProjected" />
+                      </span>
+                    </th>
                     <th className="px-3 py-2.5">Risk</th>
                   </tr>
                 </thead>
@@ -212,6 +224,9 @@ export function WhatIfSimulator({ employees }: { employees: Employee[] }) {
                         </td>
                         <td className="px-3 py-3 w-36">
                           <CapacityBar value={c.projectedUtilization} />
+                          {c.peakWeekLabel && (
+                            <p className="mt-1 text-[11px] text-ink-muted">busiest week: {c.peakWeekLabel}</p>
+                          )}
                         </td>
                         <td className="px-3 py-3">
                           <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium ${risk.bg} ${risk.border} ${risk.text}`}>
@@ -249,13 +264,19 @@ export function WhatIfSimulator({ employees }: { employees: Employee[] }) {
                       {s.assignees.map((a) => (
                         <div key={a.employee.id}>
                           <div className="flex items-center justify-between text-xs mb-1">
-                            <span className="text-ink-secondary">{a.employee.name.split(" ")[0]}</span>
+                            <span className="text-ink-secondary">
+                              {a.employee.name.split(" ")[0]}
+                              {a.peakWeekLabel && <span className="text-ink-muted"> · peak {a.peakWeekLabel}</span>}
+                            </span>
                             <span className="tabular font-medium text-ink">{a.projected}%</span>
                           </div>
                           <CapacityBar value={a.projected} showLabel={false} />
                         </div>
                       ))}
                     </div>
+                    <p className="mt-2 text-[11px] text-ink-muted">
+                      Max weekly average utilization over the {form.durationWeeks}-week window, incl. this allocation.
+                    </p>
 
                     <div className="mt-4 pt-3 border-t border-border flex items-center justify-between">
                       <span className="text-xs text-ink-secondary">Overall Risk</span>

@@ -1206,6 +1206,34 @@ export function projectedUtilizationForTicket(
   return after[0]?.utilization ?? employee.currentUtilization;
 }
 
+/**
+ * The **maximum weekly-average utilization** for `employee` across the `weeks` weeks
+ * starting from the Sunday-week containing `from`, with `extra` (a hypothetical
+ * assignment) folded into their real schedule. i.e. "how loaded is their busiest week
+ * *on average* over the selected window" — never a single-day peak.
+ *
+ * Built from `computeEmployeeWeeklyCapacity` — the exact same weekly-average engine
+ * (room-aware distribution, leave, calendar events, existing deadlines) as every other
+ * capacity figure — so the What-If candidate table and its allocation scenarios can
+ * never be computed two different ways.
+ */
+export function peakWeeklyUtilization(
+  employee: Employee,
+  tickets: AssignedTicket[],
+  getEntry: WorkLogLookup,
+  extra: AssignedTicket | null,
+  from: Date,
+  weeks: number,
+  events: CalendarEvent[] = []
+): { peakUtilization: number; weekly: WeeklyCapacityPoint[] } {
+  const load = extra ? [...tickets.filter((t) => t.id !== extra.id), extra] : tickets;
+  const weekly = computeEmployeeWeeklyCapacity(employee, load, getEntry, Math.max(1, Math.round(weeks)), from, events);
+  const peakUtilization = weekly.length
+    ? Math.max(...weekly.map((w) => w.utilization))
+    : employee.currentUtilization;
+  return { peakUtilization, weekly };
+}
+
 export interface EmployeeWorkItem {
   key: string;
   title: string;
