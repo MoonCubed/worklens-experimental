@@ -31,7 +31,7 @@ import {
 import { ticketDueLabel, adhocDueLabel } from "@/lib/due";
 import { availableCapacity } from "@/lib/capacity";
 import type { CalendarEvent } from "@/store/calendar-events-store";
-import { OVERLOAD_THRESHOLD } from "@/data/config";
+import { RECOMMENDED_CAPACITY } from "@/data/config";
 
 export interface WorkLogLookup {
   (key: string): {
@@ -485,28 +485,71 @@ function progressForItem(estimate: number, progress: number | undefined, remaini
 }
 
 // ============================================================================
-// Room-aware distribution — the "capacity across the whole future period" pass.
+// Room-aware distribution — "even distribution within an 80% capacity envelope".
 //
 // Every item starts with the even `dailyHours` split (above). This pass then reshapes
 // each FLEXIBLE item's `dayHours` — never its total, never past its deadline, never
-// before today — to prefer days where the employee actually has spare capacity that
-// day over days already full from their OTHER work, instead of blindly spreading
-// every item's hours uniformly regardless of what else is scheduled. An employee
-// pinned at capacity this week but with room next week naturally has new work land
-// mostly next week; an employee with genuinely no room anywhere before a deadline
-// still gets the plain even split (the existing overload/at-risk signal stays visible
-// — nothing is hidden by the reshaping).
+// before its start/hold — so the work lands on days that still have headroom BELOW
+// the 80% target, spread as evenly as possible across those days. Only when the work
+// genuinely cannot fit under 80% before the deadline does it spill into the 80–100%
+// band, and only when it cannot fit under 100% either does it fall back to the plain
+// even split (so the overload / At-Risk signal is never hidden by the reshaping).
 //
-// Fixed items (turnover coverage, `isCoverage`) are a frozen commitment agreed at
-// acceptance time — they still occupy their days (reducing room for everyone else that
-// day) but are never themselves reshaped.
+// Because the least-slack (most time-constrained) items are distributed FIRST — an
+// On-Hold task that can only run next week, a task due in three days — they claim
+// their room before a looser task can bleed flexible effort into it. So a small
+// flexible task is pulled into earlier capacity rather than pushing a future week
+// over 80% (the Task-A / Task-B example in the spec).
 //
-// Processing order is earliest-deadline-first: the most time-pressured item gets first
-// claim on near-term room, and items with more slack naturally get pushed toward
-// whatever room is left — which is exactly "prefer future capacity when there is any".
+// Fixed items (turnover coverage, `isCoverage`) are a frozen commitment — they still
+// occupy their days (reducing everyone else's room) but are never themselves reshaped.
 // ============================================================================
 
 const ITEM_PRIORITY_RANK: Record<ScheduledWorkItem["priority"], number> = { High: 0, Medium: 1, Low: 2 };
+
+/** The target capacity ceiling for spreading work — the scheduler prefers schedules
+ * where no day crosses this, and only goes above it when a deadline leaves no choice. */
+const DISTRIBUTION_TARGET_RATIO = RECOMMENDED_CAPACITY / 100; // 0.80
+
+const round2 = (n: number) => Math.round(n * 100) / 100;
+
+/** Spread `hours` across `days` as evenly as possible with no day exceeding its
+ * `caps[i]` — classic water-filling: give every still-open day an equal share, pin
+ * the ones that overflow at their cap, and repeat with the surplus over the rest.
+ * The total placed always equals `hours` (any rounding residue lands on the day with
+ * the most remaining room). */
+function waterfill(days: string[], caps: number[], hours: number): Record<string, number> {
+  const out = days.map(() => 0);
+  let left = hours;
+  let open = days.map((_, i) => i).filter((i) => caps[i] > 0.005);
+  for (let guard = 0; guard <= days.length + 1 && left > 0.005 && open.length > 0; guard++) {
+    const share = left / open.length;
+    const next: number[] = [];
+    for (const i of open) {
+      const take = Math.min(caps[i] - out[i], share);
+      out[i] += take;
+      left -= take;
+      if (caps[i] - out[i] > 0.005) next.push(i);
+    }
+    open = next;
+  }
+  const rounded = out.map(round2);
+  let drift = round2(hours - rounded.reduce((s, v) => s + v, 0));
+  if (Math.abs(drift) > 0.005 && days.length > 0) {
+    let best = 0;
+    let bestScore = -Infinity;
+    days.forEach((_, i) => {
+      const score = drift > 0 ? caps[i] - rounded[i] : rounded[i];
+      if (score > bestScore) {
+        bestScore = score;
+        best = i;
+      }
+    });
+    rounded[best] = Math.max(0, round2(rounded[best] + drift));
+    drift = 0;
+  }
+  return Object.fromEntries(days.map((d, i) => [d, Math.max(0, rounded[i])]));
+}
 
 function applyRoomAwareDistribution(employee: Employee, items: ScheduledWorkItem[], events: CalendarEvent[]): void {
   const active = items.filter((i) => i.remainingHours > 0 && i.workingDayKeys.length > 0);
@@ -518,7 +561,7 @@ function applyRoomAwareDistribution(employee: Employee, items: ScheduledWorkItem
     let val = ceilingCache.get(key);
     if (val === undefined) {
       const date = dateFromKey(key);
-      val = isOnLeaveDate(employee, date) ? 0 : Math.max(0, Math.round((perDay - calendarEventHoursOn(events, employee.id, date)) * 100) / 100);
+      val = isOnLeaveDate(employee, date) ? 0 : Math.max(0, round2(perDay - calendarEventHoursOn(events, employee.id, date)));
       ceilingCache.set(key, val);
     }
     return val;
@@ -534,83 +577,61 @@ function applyRoomAwareDistribution(employee: Employee, items: ScheduledWorkItem
     item.workingDayKeys.forEach((key) => used.set(key, (used.get(key) ?? 0) + (item.dayHours[key] ?? item.dailyHours)));
   });
 
-  // Earliest deadline first (ties: higher priority, then key) — the most time-pressured
-  // work gets first claim on near-term room; looser-deadline work gets what's left,
-  // which naturally lands more in the future when the near term is already full.
+  // Slack = hours of headroom this task has inside its OWN available window, measured
+  // against the 80% target. ~0 (or negative) → it has no room to move and must fill
+  // its window now; large → it can go almost anywhere. Least-slack (most constrained)
+  // work is distributed first, so it claims its room before looser work can spread
+  // flexible effort into the same days. Ties fall back to earliest deadline / priority.
+  const slackOf = (item: ScheduledWorkItem) =>
+    item.workingDayKeys.reduce((s, k) => s + DISTRIBUTION_TARGET_RATIO * ceiling(k), 0) - item.remainingHours;
+  const slackCache = new Map(flexible.map((i) => [i.key, slackOf(i)] as const));
   flexible.sort(
     (a, b) =>
+      (slackCache.get(a.key)! - slackCache.get(b.key)!) ||
       a.deadline.getTime() - b.deadline.getTime() ||
       ITEM_PRIORITY_RANK[a.priority] - ITEM_PRIORITY_RANK[b.priority] ||
       a.key.localeCompare(b.key)
   );
 
-  // Distributes `hours` across a subset of the item's days, proportionally to each
-  // day's room, with the last day absorbing rounding drift so the total is exact.
-  function proportionalSplit(days: string[], rooms: number[], totalRoom: number, hours: number): Record<string, number> {
-    const out: Record<string, number> = {};
-    let assigned = 0;
-    days.forEach((key, idx) => {
-      const share =
-        idx === days.length - 1
-          ? Math.round((hours - assigned) * 100) / 100
-          : Math.round((hours * (rooms[idx] / totalRoom)) * 100) / 100;
-      out[key] = Math.max(0, share);
-      assigned += out[key];
-    });
-    return out;
-  }
-
   flexible.forEach((item) => {
-    const rooms = item.workingDayKeys.map((key) => Math.max(0, Math.round((ceiling(key) - (used.get(key) ?? 0)) * 100) / 100));
-    const totalRoom = Math.round(rooms.reduce((s, r) => s + r, 0) * 100) / 100;
+    const keys = item.workingDayKeys;
+    const total = item.remainingHours;
+    // Per day: room left below the 80% target, and room left up to the full day.
+    const softRoom = keys.map((k) => Math.max(0, round2(DISTRIBUTION_TARGET_RATIO * ceiling(k) - (used.get(k) ?? 0))));
+    const hardRoom = keys.map((k) => Math.max(0, round2(ceiling(k) - (used.get(k) ?? 0))));
 
-    // Prefer weeks that AREN'T already loaded to the overload threshold (from more
-    // urgent work claimed so far) over ones that are — "an employee at capacity this
-    // week may still be a good candidate if they have room before the deadline" means
-    // new flexible work should skip a full week entirely when a calmer one is available,
-    // not just nudge the full week a little higher.
-    const weekOf = (key: string) => dateKey(startOfWeek(dateFromKey(key)));
-    const weekLoad = new Map<string, { used: number; capacity: number }>();
-    item.workingDayKeys.forEach((key) => {
-      const wk = weekOf(key);
-      const entry = weekLoad.get(wk) ?? { used: 0, capacity: 0 };
-      entry.used += used.get(key) ?? 0;
-      entry.capacity += ceiling(key);
-      weekLoad.set(wk, entry);
-    });
-    const comfortable = (key: string) => {
-      const load = weekLoad.get(weekOf(key));
-      return !load || load.capacity <= 0 || load.used / load.capacity < OVERLOAD_THRESHOLD / 100;
-    };
+    const belowIdx = keys.map((_, i) => (softRoom[i] > 0.005 ? i : -1)).filter((i) => i >= 0);
+    const belowTotal = round2(belowIdx.reduce((s, i) => s + softRoom[i], 0));
+    const hardTotal = round2(hardRoom.reduce((s, r) => s + r, 0));
 
     let dayHours: Record<string, number>;
-    const comfortableIdx = item.workingDayKeys.map((k, i) => (comfortable(k) ? i : -1)).filter((i) => i >= 0);
-    const comfortableRoom = Math.round(comfortableIdx.reduce((s, i) => s + rooms[i], 0) * 100) / 100;
-
-    if (comfortableRoom >= item.remainingHours - 0.05 && comfortableIdx.length > 0 && comfortableIdx.length < item.workingDayKeys.length) {
-      // Calmer weeks in the window have enough room on their own — keep the already-busy
-      // week(s) at zero for this item and land the work entirely in the calmer time.
-      const days = comfortableIdx.map((i) => item.workingDayKeys[i]);
-      const dayRooms = comfortableIdx.map((i) => rooms[i]);
-      dayHours = {};
-      item.workingDayKeys.forEach((k) => (dayHours[k] = 0));
-      Object.assign(dayHours, proportionalSplit(days, dayRooms, comfortableRoom, item.remainingHours));
-    } else if (totalRoom >= item.remainingHours - 0.05 && totalRoom > 0) {
-      // No single calmer subset covers it — spread across the whole window by room,
-      // which still favours whatever slack exists over already-full days.
-      dayHours = proportionalSplit(item.workingDayKeys, rooms, totalRoom, item.remainingHours);
+    if (belowIdx.length > 0 && belowTotal >= total - 0.05) {
+      // Fits entirely under the 80% target on the days that still have headroom for it
+      // — spread it evenly across ONLY those days, leaving days/weeks already at the
+      // target untouched. (Default balanced distribution when the whole window is calm.)
+      const days = belowIdx.map((i) => keys[i]);
+      const filled = waterfill(days, belowIdx.map((i) => softRoom[i]), total);
+      dayHours = Object.fromEntries(keys.map((k) => [k, filled[k] ?? 0]));
+    } else if (hardTotal >= total - 0.05) {
+      // Can't keep every day under 80% before the deadline — fill the sub-80% headroom
+      // evenly first, then spill the remainder evenly into the 80–100% band. Not a true
+      // overload; the At-Risk (>80%) indicator surfaces for the days that had to go over.
+      const soft = waterfill(keys.slice(), softRoom.slice(), Math.min(total, belowTotal));
+      const spill = round2(total - Object.values(soft).reduce((s, v) => s + v, 0));
+      const bandRoom = keys.map((k, i) => Math.max(0, round2(hardRoom[i] - (soft[k] ?? 0))));
+      const over = spill > 0.005 ? waterfill(keys.slice(), bandRoom, spill) : {};
+      dayHours = Object.fromEntries(keys.map((k) => [k, round2((soft[k] ?? 0) + (over[k] ?? 0))]));
     } else {
-      // No genuine slack anywhere in the window (even spread across the whole thing
-      // wouldn't fit) — keep the plain even split so overload stays visible rather
-      // than being hidden by an attempted reshape.
+      // Genuinely not enough capacity before the deadline even at 100% — keep the plain
+      // even split so the overload warning stays visible (nothing hidden by reshaping).
       dayHours = { ...item.dayHours };
     }
 
-    item.workingDayKeys.forEach((key) => used.set(key, (used.get(key) ?? 0) + (dayHours[key] ?? 0)));
+    keys.forEach((key) => used.set(key, (used.get(key) ?? 0) + (dayHours[key] ?? 0)));
     // Drop any day the reshape left at zero — `workingDayKeys` means "days this item
     // actually has hours on" everywhere else in the app (week membership, turnover
     // day counts, calendar rows), so a day it no longer touches shouldn't linger in it.
-    item.workingDayKeys = item.workingDayKeys.filter((key) => (dayHours[key] ?? 0) > 0.01);
+    item.workingDayKeys = keys.filter((key) => (dayHours[key] ?? 0) > 0.01);
     item.dayHours = dayHours;
   });
 }
